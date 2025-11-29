@@ -1,0 +1,25 @@
+# === Android Studio ===
+.gradle/
+.idea/
+build/
+app/build/
+local.properties
+*.iml
+.DS_Store
+
+# === Python (Scripts) ===
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# === Huge Model Files (절대 올리면 안 됨) ===
+*.onnx
+*.tflite
+*.ort
+*.pb
+/android/app/src/main/assets/*.onnx
+
+# === User Specific ===
+.nav/
+captures/
