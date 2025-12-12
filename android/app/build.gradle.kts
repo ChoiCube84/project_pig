@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.project_pig"
-        minSdk = 26
+        minSdk = 29
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -35,6 +35,9 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+    aaptOptions {
+        noCompress += "onnx"
+    }
 }
 
 dependencies {
@@ -46,6 +49,6 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.23.2")
+    implementation(files("libs/onnxruntime-release.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }

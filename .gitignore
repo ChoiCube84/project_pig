@@ -13,8 +13,9 @@ __pycache__/
 venv/
 .env
 
-# === Huge Model Files (절대 올리면 안 됨) ===
+# === Huge Model Files ===
 *.onnx
+*.onnx_data
 *.tflite
 *.ort
 *.pb
@@ -23,3 +24,8 @@ venv/
 # === User Specific ===
 .nav/
 captures/
+
+# === Exported Artifacts ===
+exported_model/
+android_assets_arm64/
+
