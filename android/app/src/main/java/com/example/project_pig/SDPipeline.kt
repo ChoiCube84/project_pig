@@ -19,6 +19,8 @@ import kotlin.math.sin
 
 // Shared resources to survive Activity recreation (e.g., rotation) and avoid reloading models.
 private const val GUIDANCE_SCALE = 7.5f
+private const val LCM_GUIDANCE_SCALE = 1.0f
+private const val DEFAULT_LCM_STEPS = 12
 
 class SDPipeline(context: Context) {
 
@@ -36,6 +38,7 @@ class SDPipeline(context: Context) {
     private var unetSession: OrtSession? = null
     private var vaeDecoderSession: OrtSession? = null
     private var tokenizer: ClipTokenizer
+    private val lcmScheduler = LCMScheduler()
 
     init {
         val appCtx = context.applicationContext
@@ -77,12 +80,32 @@ class SDPipeline(context: Context) {
     // [핵심] Assets에 있는 파일을 내부 저장소로 복사하고 경로를 반환하는 함수
     private fun copyAssetToFile(context: Context, fileName: String): String {
         val file = File(context.filesDir, fileName)
-        // 파일이 없거나 용량이 다르면 복사 (이미 있으면 스킵하여 속도 향상)
-        if (!file.exists() || file.length() == 0L) {
+        val assetLength = try {
+            context.assets.openFd(fileName).use { it.length }
+        } catch (_: Exception) {
+            null
+        }
+
+        val shouldCopy =
+            !file.exists() || file.length() == 0L || (assetLength != null && file.length() != assetLength)
+
+        if (shouldCopy) {
+            val tmpFile = File(context.filesDir, "$fileName.tmp")
+            if (tmpFile.exists()) tmpFile.delete()
             context.assets.open(fileName).use { inputStream ->
-                FileOutputStream(file).use { outputStream ->
+                FileOutputStream(tmpFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
+            }
+            if (file.exists()) file.delete()
+            if (!tmpFile.renameTo(file)) {
+                // Fallback: if atomic rename fails for any reason, write directly.
+                context.assets.open(fileName).use { inputStream ->
+                    FileOutputStream(file).use { outputStream ->
+                        inputStream.copyTo(outputStream)
+                    }
+                }
+                tmpFile.delete()
             }
         }
         return file.absolutePath
@@ -90,15 +113,93 @@ class SDPipeline(context: Context) {
 
     // === 아래는 기존과 동일 ===
 
-    fun generate(prompt: String, callback: (String) -> Unit): Bitmap {
+    fun generate(
+        prompt: String,
+        seed: Long = 42L,
+        callback: (String) -> Unit,
+        useLcmScheduler: Boolean = true,
+        numInferenceSteps: Int = if (useLcmScheduler) DEFAULT_LCM_STEPS else 30,
+        guidanceScale: Float = if (useLcmScheduler) LCM_GUIDANCE_SCALE else GUIDANCE_SCALE,
+    ): Bitmap {
         callback("Encoding Text...")
         // unconditional (empty) and conditional embeddings for classifier-free guidance
         val uncondEmb = encodeText("")
         val textEmbeddings = encodeText(prompt)
 
         callback("Denoising...")
+        val imageBitmap = if (useLcmScheduler) {
+            generateWithLcm(
+                uncondEmb = uncondEmb,
+                textEmbeddings = textEmbeddings,
+                seed = seed,
+                callback = callback,
+                steps = numInferenceSteps,
+                guidanceScale = guidanceScale,
+            )
+        } else {
+            generateWithDdim(
+                uncondEmb = uncondEmb,
+                textEmbeddings = textEmbeddings,
+                seed = seed,
+                callback = callback,
+                steps = numInferenceSteps,
+                guidanceScale = guidanceScale,
+            )
+        }
+
+        textEmbeddings.close()
+        uncondEmb.close()
+        callback("Done!")
+        return imageBitmap
+    }
+
+    private fun generateWithLcm(
+        uncondEmb: OnnxTensor,
+        textEmbeddings: OnnxTensor,
+        seed: Long,
+        callback: (String) -> Unit,
+        steps: Int,
+        guidanceScale: Float,
+    ): Bitmap {
+        lcmScheduler.setTimesteps(steps)
+        val timesteps = lcmScheduler.getTimesteps()
+
+        // Diffusers LCMScheduler starts from standard normal noise (no sigma scaling here).
+        var latents = generateRandomLatentsArray(1, 4, 64, 64, seed)
+        // Mix the seed to get a deterministic but different RNG stream for per-step noise injection.
+        val stepRng = Random(seed xor -7046029254386353131L)
+
+        for (i in 0 until steps) {
+            callback("LCM Step ${i + 1} / $steps")
+            val t = timesteps[i]
+
+            val epsUncond = runUNetStep(latents, uncondEmb, t)
+            val epsText = runUNetStep(latents, textEmbeddings, t)
+            val guided = combineGuidance(epsUncond, epsText, guidanceScale)
+
+            latents = lcmScheduler.step(
+                modelOutputEps = guided,
+                stepIndex = i,
+                timestep = t,
+                sample = latents,
+                rng = stepRng,
+            )
+        }
+
+        callback("Decoding Image...")
+        return decodeVAE(latents)
+    }
+
+    private fun generateWithDdim(
+        uncondEmb: OnnxTensor,
+        textEmbeddings: OnnxTensor,
+        seed: Long,
+        callback: (String) -> Unit,
+        steps: Int,
+        guidanceScale: Float,
+    ): Bitmap {
         // 1. 랜덤 노이즈 생성 (캔버스)
-        var latents = generateRandomLatents(1, 4, 64, 64)
+        var latents = generateRandomLatents(1, 4, 64, 64, seed)
 
         // 2. 스케줄러 준비 (간단한 DDPM/선형 베타 스케줄)
         val numTrainSteps = 1000
@@ -106,9 +207,6 @@ class SDPipeline(context: Context) {
         val betas = buildScaledLinearBetas(numTrainSteps, 0.00085f, 0.012f)
         val alphaCumprod = computeAlphaCumprod(betas)
 
-        // 2. 확산 모델 루프
-        // 높은 timestep(거의 맨 처음 노이즈)에 대해 여러 번 반복해야 색이 나옵니다.
-        val steps = 30
         // Match diffusers: linspace(0, numTrainSteps-1, steps)[::-1] so we reach t=0.
         val timesteps = IntArray(steps) { idx ->
             val t = ((steps - 1 - idx).toLong() * (numTrainSteps - 1).toLong()) / (steps - 1).toLong()
@@ -116,7 +214,7 @@ class SDPipeline(context: Context) {
         }
 
         for (i in 0 until steps) {
-            callback("Step ${i+1} / $steps")
+            callback("Step ${i + 1} / $steps")
 
             val t = timesteps[i]
             val prevT = if (i == steps - 1) -1 else timesteps[i + 1]
@@ -124,7 +222,7 @@ class SDPipeline(context: Context) {
             // classifier-free guidance: eps = eps_uncond + scale*(eps_text - eps_uncond)
             val epsUncond = runUNetStep(latents, uncondEmb, t)
             val epsText = runUNetStep(latents, textEmbeddings, t)
-            val guidedEps = combineGuidance(epsUncond, epsText, guidanceScale = GUIDANCE_SCALE)
+            val guidedEps = combineGuidance(epsUncond, epsText, guidanceScale = guidanceScale)
 
             // DDIM step (eta=0 deterministic)
             val updatedLatents = ddimStep(latents, guidedEps, t, prevT, alphaCumprod, eta = 0f)
@@ -137,13 +235,8 @@ class SDPipeline(context: Context) {
         }
 
         callback("Decoding Image...")
-
         val imageBitmap = decodeVAE(latents)
         latents.close()
-        textEmbeddings.close()
-        uncondEmb.close()
-
-        callback("Done!")
         return imageBitmap
     }
 
@@ -248,20 +341,18 @@ class SDPipeline(context: Context) {
 
         val result = textEncoderSession!!.run(Collections.singletonMap("input_ids", inputTensor))
         inputTensor.close()
-
-        val embeddings = result[0] as OnnxTensor
-
-        val outShape = embeddings.info.shape
-        return if (outShape.size == 3) {
-            embeddings
-        } else {
-            // Some builds may return an extra leading dim; reshape to [1, seq, 768]
+        result.use { r ->
+            val embeddings = r[0] as OnnxTensor
+            val outShape = embeddings.info.shape
             val flat = tensorToArray(embeddings)
             embeddings.close()
+
             val seq = tokenIds.size.toLong()
-            OnnxTensor.createTensor(env, FloatBuffer.wrap(flat), longArrayOf(1, seq, 768))
+            val targetShape = if (outShape.size == 3) outShape else longArrayOf(1, seq, 768)
+            return OnnxTensor.createTensor(env, FloatBuffer.wrap(flat), targetShape)
         }
     }
+
     private fun runUNetStep(latents: OnnxTensor, encoderHiddenStates: OnnxTensor, timestep: Int): OnnxTensor {
         // UNet expects a scalar timestep (shape []), not [1]. Use a direct buffer with empty shape.
         val tsBuffer = ByteBuffer.allocateDirect(java.lang.Float.BYTES)
@@ -278,9 +369,48 @@ class SDPipeline(context: Context) {
 
         val result = unetSession!!.run(inputs)
         timestepTensor.close()
+        result.use { r ->
+            val noisePred = r[0] as OnnxTensor
+            val arr = tensorToArray(noisePred)
+            val shape = noisePred.info.shape
+            noisePred.close()
+            return OnnxTensor.createTensor(env, FloatBuffer.wrap(arr), shape)
+        }
+    }
 
-        val noisePred = result[0] as OnnxTensor
-        return noisePred
+    private fun runUNetStep(sample: FloatArray, encoderHiddenStates: OnnxTensor, timestep: Int): FloatArray {
+        val latentsTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(sample), longArrayOf(1, 4, 64, 64))
+
+        val tsBuffer = ByteBuffer.allocateDirect(java.lang.Float.BYTES)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+        tsBuffer.put(timestep.toFloat())
+        tsBuffer.rewind()
+        val timestepTensor = OnnxTensor.createTensor(env, tsBuffer, longArrayOf())
+
+        val inputs = mapOf(
+            "sample" to latentsTensor,
+            "timestep" to timestepTensor,
+            "encoder_hidden_states" to encoderHiddenStates
+        )
+
+        val result = unetSession!!.run(inputs)
+        latentsTensor.close()
+        timestepTensor.close()
+        result.use { r ->
+            val noisePred = r[0] as OnnxTensor
+            val arr = tensorToArray(noisePred)
+            noisePred.close()
+            return arr
+        }
+    }
+
+    private fun combineGuidance(uncond: FloatArray, cond: FloatArray, guidanceScale: Float): FloatArray {
+        val out = FloatArray(uncond.size)
+        for (i in uncond.indices) {
+            out[i] = uncond[i] + guidanceScale * (cond[i] - uncond[i])
+        }
+        return out
     }
 
     private fun decodeVAE(latents: OnnxTensor): Bitmap {
@@ -303,21 +433,34 @@ class SDPipeline(context: Context) {
 
         val result = vaeDecoderSession!!.run(inputs)
         scaledTensor.close()
-
-        val imageTensor = result[0] as OnnxTensor
-
-        val bitmap = postProcessImage(imageTensor)
-        imageTensor.close()
-        return bitmap
+        result.use { r ->
+            val imageTensor = r[0] as OnnxTensor
+            val bitmap = postProcessImage(imageTensor)
+            imageTensor.close()
+            return bitmap
+        }
     }
 
-    private fun generateRandomLatents(b: Int, c: Int, h: Int, w: Int): OnnxTensor {
+    private fun decodeVAE(latents: FloatArray): Bitmap {
+        val latentsTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(latents), longArrayOf(1, 4, 64, 64))
+        try {
+            return decodeVAE(latentsTensor)
+        } finally {
+            latentsTensor.close()
+        }
+    }
+
+    private fun generateRandomLatents(b: Int, c: Int, h: Int, w: Int, seed: Long): OnnxTensor {
         val buffer = FloatBuffer.allocate(b * c * h * w)
         // Stable Diffusion expects standard normal noise (Gaussian), not uniform.
-        val noise = generateGaussian(buffer.capacity())
+        val noise = generateGaussian(buffer.capacity(), seed)
         for (i in 0 until buffer.capacity()) buffer.put(noise[i])
         buffer.rewind()
         return OnnxTensor.createTensor(env, buffer, longArrayOf(b.toLong(), c.toLong(), h.toLong(), w.toLong()))
+    }
+
+    private fun generateRandomLatentsArray(b: Int, c: Int, h: Int, w: Int, seed: Long): FloatArray {
+        return generateGaussian(b * c * h * w, seed)
     }
 
     private fun postProcessImage(tensor: OnnxTensor): Bitmap {

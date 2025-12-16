@@ -13,11 +13,27 @@
         android:hint="Enter prompt here (e.g., a cat)"
         android:text="a photograph of an astronaut riding a horse" />
 
+    <EditText
+        android:id="@+id/etSeed"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Seed (default: 42)"
+        android:inputType="number"
+        android:text="42"
+        android:layout_marginTop="10dp" />
+
     <Button
         android:id="@+id/btnGenerate"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Generate Image"
+        android:layout_marginTop="10dp"/>
+
+    <Button
+        android:id="@+id/btnSave"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Save Image"
         android:layout_marginTop="10dp"/>
 
     <TextView

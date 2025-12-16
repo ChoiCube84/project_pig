@@ -17,7 +17,11 @@ class ClipTokenizer(context: Context) {
     private val byteEncoder: Map<Int, String>
     private val byteDecoder: Map<String, Int>
 
-    private val pattern = Pattern.compile("""'s|'t|'re|'ve|'m|'ll|'d| ?[A-Za-z]+| ?[0-9]+| ?[^A-Za-z0-9\\s]+|\\s+(?!\\S)|\\s+""")
+    // Matches OpenAI CLIP/GPT-2 tokenization style but uses Unicode character classes for broader language support.
+    // Note: Android's regex engine may not support the UNICODE_CHARACTER_CLASS flag on some builds.
+    private val pattern = Pattern.compile(
+        """'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
 
     private val bosToken = 49406
     private val eosToken = 49407
@@ -60,12 +64,17 @@ class ClipTokenizer(context: Context) {
         val byteSeq = token.toByteArray(Charsets.UTF_8).map { it.toInt() and 0xFF }
         val text = byteSeq.joinToString("") { byteEncoder[it] ?: error("Missing byte encoder entry") }
         val bpeTokens = bpe(text).split(" ")
-        return bpeTokens.mapNotNull { vocab[it] }
+        return bpeTokens.map { piece ->
+            vocab[piece] ?: error("Missing vocab entry for BPE piece: $piece")
+        }
     }
 
     private fun bpe(token: String): String {
-        var word = token.chunked(1)
-        if (word.size == 1) return token
+        var word = token.chunked(1).toMutableList()
+        if (word.isEmpty()) return token
+        // GPT-2/CLIP byte-level BPE marks end-of-word on the last character.
+        word[word.lastIndex] = word.last() + "</w>"
+        if (word.size == 1) return word[0]
 
         var pairs = getPairs(word)
         while (true) {
@@ -133,10 +142,14 @@ class ClipTokenizer(context: Context) {
         val reader = BufferedReader(InputStreamReader(input))
         val map = mutableMapOf<Pair<String, String>, Int>()
         reader.useLines { lines ->
-            lines.drop(1).forEachIndexed { idx, line ->
-                val parts = line.split(" ")
+            var rank = 0
+            lines.drop(1).forEach { raw ->
+                val line = raw.trim()
+                if (line.isEmpty() || line.startsWith("#")) return@forEach
+                val parts = line.split(Regex("\\s+"), limit = 2)
                 if (parts.size == 2) {
-                    map[parts[0] to parts[1]] = idx
+                    map[parts[0] to parts[1]] = rank
+                    rank += 1
                 }
             }
         }
